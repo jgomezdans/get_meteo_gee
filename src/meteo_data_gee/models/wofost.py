@@ -75,44 +75,114 @@ class WofostSpec:
         out.index.name = "DAY"
         return out
 
-    def _agg_area(self, ds: xr.Dataset, tz: str) -> xr.Dataset:
-        """Aggregate a bbox hourly dataset to daily along local days.
+    # def _agg_area(self, ds: xr.Dataset, tz: str) -> xr.Dataset:
+    #     """Aggregate a bbox hourly dataset to daily along local days.
 
-        We convert the coordinate "time" from UTC to the given tz, then
-        groupby its local calendar date. xarray handles broadcasting.
+    #     We convert the coordinate "time" from UTC to the given tz, then
+    #     groupby its local calendar date. xarray handles broadcasting.
+    #     """
+    #     ds_local = ds.copy()
+
+    #     # xarray: convert the datetime coordinate to the target tz
+    #     # and add a "day" index for grouping.
+    #     time_local = ds_local.indexes["time"].tz_convert(tz)
+    #     day = xr.DataArray(
+    #         pd.DatetimeIndex(time_local.normalize()),
+    #         dims=("time",),
+    #         name="day",
+    #     )
+
+    #     # Scalars
+    #     tmax_c = ds_local[BANDS_COMMON["t2m"]].groupby(day).max() - 273.15
+    #     tmin_c = ds_local[BANDS_COMMON["t2m"]].groupby(day).min() - 273.15
+
+    #     irrad_j_m2 = ds_local[BANDS_COMMON["sw"]].groupby(day).sum()
+    #     rain_mm = ds_local[BANDS_COMMON["tp"]].groupby(day).sum() * 1000.0
+
+    #     u10 = ds_local[BANDS_COMMON["u10"]]
+    #     v10 = ds_local[BANDS_COMMON["v10"]]
+    #     wind = xr.apply_ufunc(
+    #         np.hypot, u10, v10, dask="parallelized", keep_attrs=True
+    #     )
+    #     wind_mean = wind.groupby(day).mean()
+
+    #     vap_kpa = xr.apply_ufunc(
+    #         dewpoint_to_vap_kpa,
+    #         ds_local[BANDS_COMMON["td2m"]],
+    #         dask="parallelized",
+    #         keep_attrs=False,
+    #     )
+    #     vap_daily = vap_kpa.groupby(day).mean()
+
+    #     ds_out = xr.Dataset(
+    #         {
+    #             "IRRAD_J_cm2_day": irrad_j_m2 / 10000.0,
+    #             "IRRAD_W_m2_day": irrad_j_m2 / 86400.0,
+    #             "TMIN_C": tmin_c,
+    #             "TMAX_C": tmax_c,
+    #             "VAP_kPa": vap_daily,
+    #             "WIND_ms": wind_mean,
+    #             "RAIN_mm": rain_mm,
+    #         }
+    #     )
+    #     ds_out = (
+    #         ds_out.rename({"group": "DAY"})
+    #         if "group" in ds_out.dims
+    #         else ds_out
+    #     )
+    #     ds_out = ds_out.assign_coords(
+    #         DAY=ds_out.indexes["IRRAD_J_cm2_day"].tz_localize(None)
+    #     )
+    #     return ds_out
+    def _agg_area(self, ds: xr.Dataset, tz: str) -> xr.Dataset:
+        """Aggregate hourly bbox data to daily (local calendar days).
+
+        Parameters
+        ----------
+        ds : xarray.Dataset
+            Hourly dataset with ERA5-Land band names and coords
+            (time, lat, lon).
+        tz : str
+            IANA timezone; defines local day boundaries.
+
+        Returns
+        -------
+        xarray.Dataset
+            Daily dataset with variables required by WOFOST and a
+            'DAY' coordinate (tz-naive local dates).
         """
         ds_local = ds.copy()
 
-        # xarray: convert the datetime coordinate to the target tz
-        # and add a "day" index for grouping.
-        time_local = ds_local.indexes["time"].tz_convert(tz)
-        day = xr.DataArray(
-            pd.DatetimeIndex(time_local.normalize()),
-            dims=("time",),
-            name="day",
-        )
+        # Ensure we have a proper UTC tz-aware datetime index
+        t = pd.to_datetime(ds_local.indexes["time"], utc=True)
+        # Build local-date (00:00) coordinate, tz dropped for xarray
+        day = t.tz_convert(tz).normalize().tz_localize(None)
+        # Attach as a coordinate aligned to the *time* dimension
+        ds_local = ds_local.assign_coords(day=("time", day))
 
-        # Scalars
-        tmax_c = ds_local[BANDS_COMMON["t2m"]].groupby(day).max() - 273.15
-        tmin_c = ds_local[BANDS_COMMON["t2m"]].groupby(day).min() - 273.15
-
-        irrad_j_m2 = ds_local[BANDS_COMMON["sw"]].groupby(day).sum()
-        rain_mm = ds_local[BANDS_COMMON["tp"]].groupby(day).sum() * 1000.0
-
+        # Short-hands
+        t2m = ds_local[BANDS_COMMON["t2m"]]
+        td2m = ds_local[BANDS_COMMON["td2m"]]
+        sw = ds_local[BANDS_COMMON["sw"]]
+        tp = ds_local[BANDS_COMMON["tp"]]
         u10 = ds_local[BANDS_COMMON["u10"]]
         v10 = ds_local[BANDS_COMMON["v10"]]
+
+        # Per-hour derived scalars
         wind = xr.apply_ufunc(
             np.hypot, u10, v10, dask="parallelized", keep_attrs=True
         )
-        wind_mean = wind.groupby(day).mean()
-
         vap_kpa = xr.apply_ufunc(
-            dewpoint_to_vap_kpa,
-            ds_local[BANDS_COMMON["td2m"]],
-            dask="parallelized",
-            keep_attrs=False,
+            dewpoint_to_vap_kpa, td2m, dask="parallelized", keep_attrs=False
         )
-        vap_daily = vap_kpa.groupby(day).mean()
+
+        # Group by the attached 'day' coordinate (dimension='time')
+        tmax_c = t2m.groupby("day").max() - 273.15
+        tmin_c = t2m.groupby("day").min() - 273.15
+        irrad_j_m2 = sw.groupby("day").sum()
+        rain_mm = (tp * 1000.0).groupby("day").sum()
+        wind_mean = wind.groupby("day").mean()
+        vap_daily = vap_kpa.groupby("day").mean()
 
         ds_out = xr.Dataset(
             {
@@ -125,14 +195,14 @@ class WofostSpec:
                 "RAIN_mm": rain_mm,
             }
         )
-        ds_out = (
-            ds_out.rename({"group": "DAY"})
-            if "group" in ds_out.dims
-            else ds_out
-        )
+
+        # Promote 'day' to a proper coord named 'DAY'
+        if "day" in ds_out.dims:
+            ds_out = ds_out.rename({"day": "DAY"})
         ds_out = ds_out.assign_coords(
-            DAY=ds_out.indexes["IRRAD_J_cm2_day"].tz_localize(None)
+            DAY=ds_out["IRRAD_J_cm2_day"].coords["DAY"]
         )
+
         return ds_out
 
     def postprocess_site(

@@ -8,6 +8,7 @@ units, tz handling) is framework-agnostic.
 
 from __future__ import annotations
 
+import logging
 from typing import Iterable
 
 import ee  # type: ignore
@@ -25,15 +26,49 @@ from .utils import (
 )
 
 
+# Basic configuration for logging
+logging.basicConfig(
+    level=logging.INFO,  # Set the logging level to INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",  # Define log message format
+)
+
+# Create a logger object
+logger = logging.getLogger(
+    __name__
+)  # Use __name__ to get a logger named after the current module
+
+
+def _dem_image_and_band(dem_asset: str) -> tuple["ee.Image", str]:
+    """Return a single-image mosaic and the band name for a DEM asset."""
+    import ee  # type: ignore
+
+    ic = ee.ImageCollection(dem_asset)
+    # Map asset → band name
+    if "COPERNICUS/DEM" in dem_asset:
+        band = "DEM"
+    elif "USGS/GTOPO30" in dem_asset:
+        band = "elevation"
+    else:
+        # Try to infer the first band of the first image if unknown
+        first = ee.Image(ic.first())
+        band = ee.List(first.bandNames()).get(0).getInfo()
+
+    # Mosaic all tiles into a single Image, then select the band
+    img = ic.select([band]).mosaic()
+    return img, band
+
+
 # ------------------------- Public entry point -------------------------------
 
 
 def get_meteo_data(
     loc: Iterable[float],
-    year: int,
     model: str,
     ee_project: str,
     *,
+    year: int | None = None,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
     tz: str = "UTC",
     variables: tuple[str, ...] | None = None,
     dem_asset: str = DEM_DEFAULT,
@@ -73,7 +108,31 @@ def get_meteo_data(
     course belongs to a nasty capitalist company. The rest of the pipeline is
     pure pandas/xarray.
     """
+    if year is not None and (start is not None or end is not None):
+        msg = "Specify either year or start/end, not both."
+        raise ValueError(msg)
+    if year is not None:
+        start, end = year_bounds_utc(year)
+    elif start is None or end is None:
+        msg = "Must specify either year or both start and end."
+        raise ValueError(msg)
+    if start.tzinfo is None or start.tzinfo.utcoffset(start) is None:
+        start = start.tz_localize("UTC")
+        end = end.tz_localize("UTC")
+    else:
+        start = start.tz_convert("UTC")
+        end = end.tz_convert("UTC")
+
+    logger.debug(
+        "Fetching meteo data for loc=%s, model=%s, start=%s, end=%s, tz=%s",
+        loc,
+        model,
+        start,
+        end,
+        tz,
+    )
     model = model.lower().strip()
+
     if model not in MODELS:
         msg = f"Unknown model '{model}'. Use 'db' or 'wofost'."
         raise ValueError(msg)
@@ -89,7 +148,8 @@ def get_meteo_data(
     else:
         bands = mspec.required_bands
 
-    start, end = year_bounds_utc(year)
+    if not bands:
+        raise ValueError("No bands to fetch (empty selection).")
 
     ee_init_kwargs = {}
     if ee_project is not None:
@@ -100,6 +160,7 @@ def get_meteo_data(
     if is_site(loc):
         lat, lon = parse_site(loc)
         # Fetch hourly site timeseries and DEM scalar
+        logger.info("Fetching site data at lat=%.4f, lon=%.4f", lat, lon)
         df_hourly = _xee_fetch_site_hourly(
             collection_id=ERA5L_ID,
             bands=bands,
@@ -109,12 +170,15 @@ def get_meteo_data(
             end=end,
             ee_init_kwargs=ee_init_kwargs,
         )
+        logger.info("Got hourly data with %d timestamps", len(df_hourly))
+        logger.info("Fetching site DEM at lat=%.4f, lon=%.4f", lat, lon)
         dem_value = _xee_fetch_site_dem(
             dem_asset=dem_asset,
             lat=lat,
             lon=lon,
             ee_init_kwargs=ee_init_kwargs,
         )
+        logger.info("Got DEM value %.2f m", dem_value)
         return mspec.postprocess_site(df_hourly, dem_value, tz)
 
     # BBox path
@@ -154,41 +218,31 @@ def get_meteo_data(
 
 def _ee_open_dataset(
     *,
-    src: "ee.ImageCollection | ee.Image",
+    src: "str | ee.ImageCollection | ee.Image",
     geometry: "ee.Geometry",
     bands: tuple[str, ...] | None = None,
     scale: float = 0.1,
     projection: "ee.Projection | None" = None,
     ee_init_kwargs: dict | None = None,
 ) -> "xr.Dataset":
-    """Open an EE ImageCollection/Image as xarray.Dataset.
+    """Open an EE ImageCollection/Image/asset-id as xarray.Dataset.
 
-    Parameters
-    ----------
-    src
-        EE ImageCollection (hourly) or Image (DEM).
-    geometry
-        ee.Geometry.Point for site, ee.Geometry.Rectangle for bbox.
-    bands
-        Optional band subset to select on the collection/image.
-    scale
-        Pixel size in degrees. 0.1 ~ 10 km for ERA5-Land.
-    projection
-        EE projection. For ERA5-Land use ic.first().select(0).projection().
-
-    Returns
-    -------
-    xarray.Dataset
-        Dataset with dims including 'time' for collections.
+    We prefer passing an ImageCollection (even for DEM) and select bands
+    server-side. If `src` is a string, it's treated as an EE asset id.
     """
     import ee  # type: ignore
+    import xarray as xr
 
     try:
         ee.Initialize(**(ee_init_kwargs or {}))
     except Exception:
         raise RuntimeError("Please initialise Earth Engine API before use.")
 
-    obj = src
+    if isinstance(src, str):
+        obj = ee.ImageCollection(src)
+    else:
+        obj = src
+
     if bands:
         obj = obj.select(list(bands))
 
@@ -199,7 +253,66 @@ def _ee_open_dataset(
         geometry=geometry,
         scale=scale,
     )
+
+    if bands:
+        keep = [b for b in bands if b in ds.data_vars]
+        ds = ds[keep] if keep else ds
+
     return ds
+
+
+# def _ee_open_dataset(
+#     *,
+#     src: "ee.ImageCollection | ee.Image",
+#     geometry: "ee.Geometry",
+#     bands: tuple[str, ...] | None = None,
+#     scale: float = 0.1,
+#     projection: "ee.Projection | None" = None,
+#     ee_init_kwargs: dict | None = None,
+# ) -> "xr.Dataset":
+#     """Open an EE ImageCollection/Image as xarray.Dataset.
+
+#     Parameters
+#     ----------
+#     src
+#         EE ImageCollection (hourly) or Image (DEM).
+#     geometry
+#         ee.Geometry.Point for site, ee.Geometry.Rectangle for bbox.
+#     bands
+#         Optional band subset to select on the collection/image.
+#     scale
+#         Pixel size in degrees. 0.1 ~ 10 km for ERA5-Land.
+#     projection
+#         EE projection. For ERA5-Land use ic.first().select(0).projection().
+
+#     Returns
+#     -------
+#     xarray.Dataset
+#         Dataset with dims including 'time' for collections.
+#     """
+#     import ee  # type: ignore
+
+#     try:
+#         ee.Initialize(**(ee_init_kwargs or {}))
+#     except Exception:
+#         raise RuntimeError("Please initialise Earth Engine API before use.")
+
+#     obj = src
+#     if bands:
+#         obj = obj.select(list(bands))
+
+#     ds = xr.open_dataset(
+#         obj,
+#         engine="ee",
+#         projection=projection,
+#         geometry=geometry,
+#         scale=scale,
+#     )
+#     if bands:
+#         # Client-side guard: keep only requested bands if present
+#         keep = [b for b in bands if b in ds.data_vars]
+#         ds = ds[keep] if keep else ds
+#     return ds
 
 
 def _xee_fetch_site_hourly(
@@ -212,11 +325,7 @@ def _xee_fetch_site_hourly(
     end: pd.Timestamp,
     ee_init_kwargs: dict | None = None,
 ) -> pd.DataFrame:
-    """Nearest-neighbour hourly site series → pandas.DataFrame.
-
-    Reuses _ee_open_dataset with a Point geometry, squeezes spatial dims,
-    ensures UTC hourly continuity.
-    """
+    """Nearest-neighbour hourly site series → pandas.DataFrame."""
     import ee  # type: ignore
 
     try:
@@ -224,27 +333,27 @@ def _xee_fetch_site_hourly(
     except Exception:
         raise RuntimeError("Please initialise Earth Engine API before use.")
 
-    ic = ee.ImageCollection(collection_id).filterDate(
-        start.isoformat(), end.isoformat()
-    )
+    ic = (
+        ee.ImageCollection(collection_id)
+        .filterDate(start.isoformat(), end.isoformat())
+        .select(list(bands))
+    )  # <-- server-side subset
     proj = ic.first().select(0).projection()
     geom = ee.Geometry.Point(float(lon), float(lat))
 
     ds = _ee_open_dataset(
         src=ic,
         geometry=geom,
-        bands=bands,
+        bands=bands,  # <-- client-side guard
         scale=0.1,
         projection=proj,
         ee_init_kwargs=ee_init_kwargs,
     )
 
-    # Squeeze 1x1 lat/lon to get a pure time series
     for d in ("lat", "lon"):
         if d in ds.dims and ds.sizes.get(d, 1) == 1:
             ds = ds.squeeze(d, drop=True)
 
-    # Make time tz-aware UTC and continuous hourly
     t = pd.DatetimeIndex(ds.indexes["time"])
     t = t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
     full = pd.date_range(start, end, freq="h", inclusive="left").tz_convert(
@@ -253,33 +362,11 @@ def _xee_fetch_site_hourly(
     ds = ds.assign_coords(time=t).reindex(time=full)
 
     df = ds.to_dataframe().reset_index().set_index("time").sort_index()
+
+    if bands:
+        df = df[[b for b in bands if b in df.columns]]
+
     return df
-
-
-def _xee_fetch_site_dem(
-    *,
-    dem_asset: str,
-    lat: float,
-    lon: float,
-    ee_init_kwargs: dict | None = None,
-) -> float:
-    """Nearest-neighbour DEM height at a point (meters)."""
-
-    img = ee.Image(dem_asset)
-    geom = ee.Geometry.Point(float(lon), float(lat))
-
-    ds = _ee_open_dataset(
-        src=img, geometry=geom, scale=0.1, ee_init_kwargs=ee_init_kwargs
-    )
-
-    if not ds.data_vars:
-        raise RuntimeError("DEM dataset returned no variables.")
-    band = next(iter(ds.data_vars))
-    da = ds[band]
-    for d in ("lat", "lon"):
-        if d in da.dims and da.sizes.get(d, 1) == 1:
-            da = da.squeeze(d, drop=True)
-    return float(da.values)
 
 
 def _xee_fetch_bbox_hourly(
@@ -302,9 +389,11 @@ def _xee_fetch_bbox_hourly(
     except Exception:
         raise RuntimeError("Please initialise Earth Engine API before use.")
 
-    ic = ee.ImageCollection(collection_id).filterDate(
-        start.isoformat(), end.isoformat()
-    )
+    ic = (
+        ee.ImageCollection(collection_id)
+        .filterDate(start.isoformat(), end.isoformat())
+        .select(list(bands))
+    )  # server-side subset
     proj = ic.first().select(0).projection()
     geom = ee.Geometry.Rectangle(
         float(min_lon), float(min_lat), float(max_lon), float(max_lat)
@@ -319,20 +408,115 @@ def _xee_fetch_bbox_hourly(
         ee_init_kwargs=ee_init_kwargs,
     )
 
-    # Sort lat/lon ascending for consistency
     if "lat" in ds.coords:
         ds = ds.sortby("lat")
     if "lon" in ds.coords:
         ds = ds.sortby("lon")
 
-    # Ensure UTC hourly continuity
     t = pd.DatetimeIndex(ds.indexes["time"])
     t = t.tz_localize("UTC") if t.tz is None else t.tz_convert("UTC")
-    full = pd.date_range(start, end, freq="H", inclusive="left").tz_convert(
+    full = pd.date_range(start, end, freq="h", inclusive="left").tz_convert(
         "UTC"
     )
     ds = ds.assign_coords(time=t).reindex(time=full)
+
+    # Final trim to requested bands (defensive)
+    if bands:
+        keep = [b for b in bands if b in ds.data_vars]
+        ds = ds[keep] if keep else ds
+
     return ds
+
+
+# def _xee_fetch_site_dem(
+#     *,
+#     dem_asset: str,
+#     lat: float,
+#     lon: float,
+#     ee_init_kwargs: dict | None = None,
+# ) -> float:
+#     """Nearest-neighbour DEM height at a point (meters)."""
+
+#     img = ee.Image(dem_asset).select("DEM")
+#     geom = ee.Geometry.Point(float(lon), float(lat))
+
+#     ds = _ee_open_dataset(
+#         src=img, geometry=geom, scale=0.1, ee_init_kwargs=ee_init_kwargs
+#     )
+
+#     if not ds.data_vars:
+#         raise RuntimeError("DEM dataset returned no variables.")
+#     band = next(iter(ds.data_vars))
+#     da = ds[band]
+#     for d in ("lat", "lon"):
+#         if d in da.dims and da.sizes.get(d, 1) == 1:
+#             da = da.squeeze(d, drop=True)
+#     return float(da.values)
+
+
+# def _xee_fetch_bbox_dem(
+#     *,
+#     dem_asset: str,
+#     min_lon: float,
+#     min_lat: float,
+#     max_lon: float,
+#     max_lat: float,
+#     ee_init_kwargs: dict | None = None,
+# ) -> "xr.DataArray":
+#     """Static DEM grid over bbox (lat, lon)."""
+
+#     img = ee.Image(dem_asset).select("DEM")
+#     geom = ee.Geometry.Rectangle(
+#         float(min_lon), float(min_lat), float(max_lon), float(max_lat)
+#     )
+
+#     ds = _ee_open_dataset(
+#         src=img, geometry=geom, scale=0.1, ee_init_kwargs=ee_init_kwargs
+#     )
+
+
+#     if not ds.data_vars:
+#         raise RuntimeError("DEM dataset returned no variables.")
+#     band = next(iter(ds.data_vars))
+#     da = ds[band].rename("DEM")
+#     if "lat" in da.coords:
+#         da = da.sortby("lat")
+#     if "lon" in da.coords:
+#         da = da.sortby("lon")
+#     da.attrs["units"] = "m"
+#     return da
+
+
+def _xee_fetch_site_dem(
+    *,
+    dem_asset: str,
+    lat: float,
+    lon: float,
+    ee_init_kwargs: dict | None = None,
+) -> float:
+    """Nearest-neighbour DEM height at a point (meters).
+
+    Fast path: sample the mosaicked DEM Image at the point using EE API.
+    Avoids passing a huge ImageCollection to xee.
+    """
+    import ee  # type: ignore
+
+    try:
+        ee.Initialize(**(ee_init_kwargs or {}))
+    except Exception:
+        raise RuntimeError("Please initialise Earth Engine API before use.")
+
+    img, band = _dem_image_and_band(dem_asset)
+    geom = ee.Geometry.Point(float(lon), float(lat))
+
+    # Use a small scale; DEM native ~30m for GLO30. Nearest by default.
+    val = (
+        img.sample(region=geom, scale=30, numPixels=1)
+        .first()
+        .get(band)
+        .getInfo()
+    )
+    return float(val)
 
 
 def _xee_fetch_bbox_dem(
@@ -344,20 +528,41 @@ def _xee_fetch_bbox_dem(
     max_lat: float,
     ee_init_kwargs: dict | None = None,
 ) -> "xr.DataArray":
-    """Static DEM grid over bbox (lat, lon)."""
+    """Static DEM grid over bbox (lat, lon), using a single mosaicked image.
 
-    img = ee.Image(dem_asset)
+    We mosaic to a single Image, then wrap it in a 1-image collection so
+    xee doesn't index across thousands of tiles.
+    """
+    import ee  # type: ignore
+    import xarray as xr
+
+    try:
+        ee.Initialize(**(ee_init_kwargs or {}))
+    except Exception:
+        raise RuntimeError("Please initialise Earth Engine API before use.")
+
+    img, band = _dem_image_and_band(dem_asset)
+    ic = ee.ImageCollection([img])  # one-image collection
+
     geom = ee.Geometry.Rectangle(
         float(min_lon), float(min_lat), float(max_lon), float(max_lat)
     )
 
-    ds = _ee_open_dataset(
-        src=img, geometry=geom, scale=0.1, ee_init_kwargs=ee_init_kwargs
+    # Use a reasonable scale. 0.001 ≈ 100 m; 0.0003 ≈ 30 m at equator.
+    # Keep it modest to avoid huge rasters; users can resample later.
+    ds = xr.open_dataset(
+        ic,
+        engine="ee",
+        geometry=geom,
+        scale=0.001,  # ~100 m, tune if you want closer to 30 m
     )
 
-    if not ds.data_vars:
-        raise RuntimeError("DEM dataset returned no variables.")
-    band = next(iter(ds.data_vars))
+    if band not in ds.data_vars:
+        # Some backends may name the sole band differently; fall back
+        if not ds.data_vars:
+            raise RuntimeError("DEM dataset returned no variables.")
+        band = next(iter(ds.data_vars))
+
     da = ds[band].rename("DEM")
     if "lat" in da.coords:
         da = da.sortby("lat")
