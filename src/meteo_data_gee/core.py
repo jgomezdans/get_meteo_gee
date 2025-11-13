@@ -12,6 +12,7 @@ import logging
 from typing import Iterable
 
 import ee  # type: ignore
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -202,14 +203,20 @@ def get_meteo_data(
         end=end,
         ee_init_kwargs=ee_init_kwargs,
     )
-    dem_grid = _xee_fetch_bbox_dem(
+    dem_grid = _xee_fetch_bbox_dem_on_grid(
         dem_asset=dem_asset,
-        min_lon=min_lon,
-        min_lat=min_lat,
-        max_lon=max_lon,
-        max_lat=max_lat,
+        lats=ds_hourly["lat"].values,
+        lons=ds_hourly["lon"].values,
         ee_init_kwargs=ee_init_kwargs,
     )
+    # dem_grid = _xee_fetch_bbox_dem(
+    #     dem_asset=dem_asset,
+    #     min_lon=min_lon,
+    #     min_lat=min_lat,
+    #     max_lon=max_lon,
+    #     max_lat=max_lat,
+    #     ee_init_kwargs=ee_init_kwargs,
+    # )
     return mspec.postprocess_area(ds_hourly, dem_grid, tz)
 
 
@@ -259,60 +266,6 @@ def _ee_open_dataset(
         ds = ds[keep] if keep else ds
 
     return ds
-
-
-# def _ee_open_dataset(
-#     *,
-#     src: "ee.ImageCollection | ee.Image",
-#     geometry: "ee.Geometry",
-#     bands: tuple[str, ...] | None = None,
-#     scale: float = 0.1,
-#     projection: "ee.Projection | None" = None,
-#     ee_init_kwargs: dict | None = None,
-# ) -> "xr.Dataset":
-#     """Open an EE ImageCollection/Image as xarray.Dataset.
-
-#     Parameters
-#     ----------
-#     src
-#         EE ImageCollection (hourly) or Image (DEM).
-#     geometry
-#         ee.Geometry.Point for site, ee.Geometry.Rectangle for bbox.
-#     bands
-#         Optional band subset to select on the collection/image.
-#     scale
-#         Pixel size in degrees. 0.1 ~ 10 km for ERA5-Land.
-#     projection
-#         EE projection. For ERA5-Land use ic.first().select(0).projection().
-
-#     Returns
-#     -------
-#     xarray.Dataset
-#         Dataset with dims including 'time' for collections.
-#     """
-#     import ee  # type: ignore
-
-#     try:
-#         ee.Initialize(**(ee_init_kwargs or {}))
-#     except Exception:
-#         raise RuntimeError("Please initialise Earth Engine API before use.")
-
-#     obj = src
-#     if bands:
-#         obj = obj.select(list(bands))
-
-#     ds = xr.open_dataset(
-#         obj,
-#         engine="ee",
-#         projection=projection,
-#         geometry=geometry,
-#         scale=scale,
-#     )
-#     if bands:
-#         # Client-side guard: keep only requested bands if present
-#         keep = [b for b in bands if b in ds.data_vars]
-#         ds = ds[keep] if keep else ds
-#     return ds
 
 
 def _xee_fetch_site_hourly(
@@ -428,65 +381,6 @@ def _xee_fetch_bbox_hourly(
     return ds
 
 
-# def _xee_fetch_site_dem(
-#     *,
-#     dem_asset: str,
-#     lat: float,
-#     lon: float,
-#     ee_init_kwargs: dict | None = None,
-# ) -> float:
-#     """Nearest-neighbour DEM height at a point (meters)."""
-
-#     img = ee.Image(dem_asset).select("DEM")
-#     geom = ee.Geometry.Point(float(lon), float(lat))
-
-#     ds = _ee_open_dataset(
-#         src=img, geometry=geom, scale=0.1, ee_init_kwargs=ee_init_kwargs
-#     )
-
-#     if not ds.data_vars:
-#         raise RuntimeError("DEM dataset returned no variables.")
-#     band = next(iter(ds.data_vars))
-#     da = ds[band]
-#     for d in ("lat", "lon"):
-#         if d in da.dims and da.sizes.get(d, 1) == 1:
-#             da = da.squeeze(d, drop=True)
-#     return float(da.values)
-
-
-# def _xee_fetch_bbox_dem(
-#     *,
-#     dem_asset: str,
-#     min_lon: float,
-#     min_lat: float,
-#     max_lon: float,
-#     max_lat: float,
-#     ee_init_kwargs: dict | None = None,
-# ) -> "xr.DataArray":
-#     """Static DEM grid over bbox (lat, lon)."""
-
-#     img = ee.Image(dem_asset).select("DEM")
-#     geom = ee.Geometry.Rectangle(
-#         float(min_lon), float(min_lat), float(max_lon), float(max_lat)
-#     )
-
-#     ds = _ee_open_dataset(
-#         src=img, geometry=geom, scale=0.1, ee_init_kwargs=ee_init_kwargs
-#     )
-
-
-#     if not ds.data_vars:
-#         raise RuntimeError("DEM dataset returned no variables.")
-#     band = next(iter(ds.data_vars))
-#     da = ds[band].rename("DEM")
-#     if "lat" in da.coords:
-#         da = da.sortby("lat")
-#     if "lon" in da.coords:
-#         da = da.sortby("lon")
-#     da.attrs["units"] = "m"
-#     return da
-
-
 def _xee_fetch_site_dem(
     *,
     dem_asset: str,
@@ -519,21 +413,15 @@ def _xee_fetch_site_dem(
     return float(val)
 
 
-def _xee_fetch_bbox_dem(
+def _xee_fetch_bbox_dem_on_grid(
     *,
     dem_asset: str,
-    min_lon: float,
-    min_lat: float,
-    max_lon: float,
-    max_lat: float,
+    lats: np.ndarray,
+    lons: np.ndarray,
     ee_init_kwargs: dict | None = None,
 ) -> "xr.DataArray":
-    """Static DEM grid over bbox (lat, lon), using a single mosaicked image.
-
-    We mosaic to a single Image, then wrap it in a 1-image collection so
-    xee doesn't index across thousands of tiles.
-    """
     import ee  # type: ignore
+    import numpy as np
     import xarray as xr
 
     try:
@@ -541,32 +429,55 @@ def _xee_fetch_bbox_dem(
     except Exception:
         raise RuntimeError("Please initialise Earth Engine API before use.")
 
-    img, band = _dem_image_and_band(dem_asset)
-    ic = ee.ImageCollection([img])  # one-image collection
+    # Mosaic DEM and choose band
+    ic = ee.ImageCollection(dem_asset)
+    if "COPERNICUS/DEM" in dem_asset:
+        band = "DEM"
+    elif "USGS/GTOPO30" in dem_asset:
+        band = "elevation"
+    else:
+        first = ee.Image(ic.first())
+        band = ee.List(first.bandNames()).get(0).getInfo()
+    img = ic.select([band]).mosaic()
 
-    geom = ee.Geometry.Rectangle(
-        float(min_lon), float(min_lat), float(max_lon), float(max_lat)
+    # Build FeatureCollection of grid centres with (i=lat_idx, j=lon_idx)
+    lat_arr = np.asarray(lats)
+    lon_arr = np.asarray(lons)
+    ny, nx = lat_arr.size, lon_arr.size
+
+    feats = []
+    for i, lat in enumerate(lat_arr):
+        for j, lon in enumerate(lon_arr):
+            geom = ee.Geometry.Point(float(lon), float(lat))
+            feats.append(ee.Feature(geom, {"i": int(i), "j": int(j)}))
+    fc = ee.FeatureCollection(feats)
+
+    # >>> Preserve i/j: use sampleRegions, not sample
+    samp = img.sampleRegions(
+        collection=fc,
+        properties=["i", "j"],
+        scale=30,  # ~30 m for GLO30
+        geometries=False,
     )
 
-    # Use a reasonable scale. 0.001 ≈ 100 m; 0.0003 ≈ 30 m at equator.
-    # Keep it modest to avoid huge rasters; users can resample later.
-    ds = xr.open_dataset(
-        ic,
-        engine="ee",
-        geometry=geom,
-        scale=0.001,  # ~100 m, tune if you want closer to 30 m
+    # Bring results client-side
+    recs_py = samp.getInfo()["features"]  # list of Features with properties
+
+    # Reassemble to (lat, lon) grid
+    arr = np.full((ny, nx), np.nan, dtype=float)
+    for f in recs_py:
+        props = f["properties"]
+        i = int(props["i"])
+        j = int(props["j"])
+        v = props.get(band)
+        if v is not None:
+            arr[i, j] = float(v)
+
+    da = xr.DataArray(
+        arr,
+        coords={"lat": lat_arr, "lon": lon_arr},
+        dims=("lat", "lon"),
+        name="DEM_m",
     )
-
-    if band not in ds.data_vars:
-        # Some backends may name the sole band differently; fall back
-        if not ds.data_vars:
-            raise RuntimeError("DEM dataset returned no variables.")
-        band = next(iter(ds.data_vars))
-
-    da = ds[band].rename("DEM")
-    if "lat" in da.coords:
-        da = da.sortby("lat")
-    if "lon" in da.coords:
-        da = da.sortby("lon")
     da.attrs["units"] = "m"
     return da
