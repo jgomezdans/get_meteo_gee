@@ -13,7 +13,7 @@ authors = [{name = "Jose Gomez-Dans", email = "jose.gomez-dans@kcl.ac.uk"}]
 keywords = ["ERA5-Land", "GEE", "xee", "agrometeorology", "WOFOST", "D&B"]
 
 dependencies = [
-  "xee>=0.2.0",     # adjust to your actual version
+  "xee",
   "xarray>=2023.6.0",
   "numpy>=1.25",
   "pandas>=2.0",
