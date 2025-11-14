@@ -43,3 +43,34 @@ REQUIRED_BANDS = {
         BANDS_COMMON["v10"],
     ),
 }
+# ERA5-Land hourly
+ERA5L_ID = "ECMWF/ERA5_LAND/HOURLY"
+
+# DEMs
+DEM_DEFAULT = "COPERNICUS/DEM/GLO30"
+DEM_GTOPO30 = "USGS/GTOPO30"
+
+# ---------------------------------------------------------------------------
+# FireDanger (CEMS Fire danger indices, daily)
+# ---------------------------------------------------------------------------
+FIREDANGER_ID = (
+    "projects/climate-engine-pro/assets/ce-cems-fire-daily-4-1"
+)
+
+FIREDANGER_BANDS = (
+    "build_up_index",
+    "burning_index",
+    "drought_code",
+    "drought_factor",
+    "duff_moisture_code",
+    "energy_release_component",
+    "fine_fuel_moisture_code",
+    "fire_daily_severity_rating",
+    "fire_danger_index",
+    "fire_weather_index",
+    "ignition_component",
+    "initial_fire_spread_index",
+    "keetch_byram_drought_index",
+    "spread_component",
+)
+# Required bands for FireDanger model

@@ -73,9 +73,11 @@ def get_meteo_data(
     tz: str = "UTC",
     variables: tuple[str, ...] | None = None,
     dem_asset: str = DEM_DEFAULT,
-    ee_opt_url: str | None = "https://earthengine-highvolume.googleapis.com",
+    ee_opt_url: str | None = (
+        "https://earthengine-highvolume.googleapis.com"
+    ),
 ) -> pd.DataFrame | xr.Dataset:
-    """Fetch ERA5-Land hourly via xee/GEE and return model-specific output.
+    """Fetch meteo / fire danger data via xee/GEE and postprocess by model.
 
     Parameters
     ----------
@@ -86,10 +88,14 @@ def get_meteo_data(
     year
         Calendar year (UTC bounds Jan 1 00:00 to Jan 1 next year 00:00).
     model
-        Either "db" (hourly D&B) or "wofost" (daily aggregates).
+        One of:
+        - "db"        : hourly D&B indices (ERA5-Land hourly).
+        - "wofost"    : daily aggregates derived from ERA5-Land hourly.
+        - "firedanger": daily fire danger indices (CEMS Fire).
     tz
-        IANA timezone for WOFOST daily aggregation windows. Ignored for D&B.
-        Default is "UTC".
+        IANA timezone for daily aggregation windows where relevant
+        (e.g. WOFOST). Ignored for pure-hourly models and for models
+        that are already daily (FireDanger).
     variables
         Optional subset of variables to fetch (must be a subset of the
         model's required bands). Most users should leave this as None.
@@ -104,10 +110,9 @@ def get_meteo_data(
 
     Notes
     -----
-    This function delegates GEE/xee access to small adapters. In the future,
-    we might be able to support other data backends other than GEE, which of
-    course belongs to a nasty capitalist company. The rest of the pipeline is
-    pure pandas/xarray.
+    This function delegates GEE/xee access to small adapters. Models may
+    use different collections (e.g. ERA5-Land hourly vs CEMS Fire daily)
+    and different temporal logic (hourly vs daily).
     """
     if year is not None and (start is not None or end is not None):
         msg = "Specify either year or start/end, not both."
@@ -117,6 +122,8 @@ def get_meteo_data(
     elif start is None or end is None:
         msg = "Must specify either year or both start and end."
         raise ValueError(msg)
+
+    # Normalise to UTC tz-aware timestamps
     if start.tzinfo is None or start.tzinfo.utcoffset(start) is None:
         start = start.tz_localize("UTC")
         end = end.tz_localize("UTC")
@@ -132,12 +139,18 @@ def get_meteo_data(
         end,
         tz,
     )
-    model = model.lower().strip()
+    model_key = model.lower().strip()
 
-    if model not in MODELS:
-        msg = f"Unknown model '{model}'. Use 'db' or 'wofost'."
+    if model_key not in MODELS:
+        msg = (
+            f"Unknown model '{model}'. Use 'db', 'wofost', or 'firedanger'."
+        )
         raise ValueError(msg)
-    mspec = MODELS[model]
+    mspec = MODELS[model_key]
+
+    # Collection and temporal frequency come from the model spec.
+    collection_id = getattr(mspec, "collection_id", ERA5L_ID)
+    frequency = getattr(mspec, "frequency", "hourly")
 
     req = set(mspec.required_bands)
     if variables is not None:
@@ -152,18 +165,49 @@ def get_meteo_data(
     if not bands:
         raise ValueError("No bands to fetch (empty selection).")
 
-    ee_init_kwargs = {}
+    ee_init_kwargs: dict[str, object] = {}
     if ee_project is not None:
         ee_init_kwargs["project"] = ee_project
     if ee_opt_url is not None:
         ee_init_kwargs["opt_url"] = ee_opt_url
 
+    # ------------------------- Site path ---------------------------------
     if is_site(loc):
         lat, lon = parse_site(loc)
-        # Fetch hourly site timeseries and DEM scalar
-        logger.info("Fetching site data at lat=%.4f, lon=%.4f", lat, lon)
-        df_hourly = _xee_fetch_site_hourly(
-            collection_id=ERA5L_ID,
+        logger.info(
+            "Fetching site data at lat=%.4f, lon=%.4f (freq=%s)",
+            lat,
+            lon,
+            frequency,
+        )
+
+        if frequency == "hourly":
+            # ERA5-Land-style hourly collections (db, wofost)
+            df_hourly = _xee_fetch_site_hourly(
+                collection_id=collection_id,
+                bands=bands,
+                lat=lat,
+                lon=lon,
+                start=start,
+                end=end,
+                ee_init_kwargs=ee_init_kwargs,
+            )
+            logger.info("Got hourly data with %d timestamps", len(df_hourly))
+            logger.info(
+                "Fetching site DEM at lat=%.4f, lon=%.4f", lat, lon
+            )
+            dem_value = _xee_fetch_site_dem(
+                dem_asset=dem_asset,
+                lat=lat,
+                lon=lon,
+                ee_init_kwargs=ee_init_kwargs,
+            )
+            logger.info("Got DEM value %.2f m", dem_value)
+            return mspec.postprocess_site(df_hourly, dem_value, tz)
+
+        # Daily collections (e.g. FireDanger)
+        ds_daily = _xee_fetch_site_daily(
+            collection_id=collection_id,
             bands=bands,
             lat=lat,
             lon=lon,
@@ -171,7 +215,9 @@ def get_meteo_data(
             end=end,
             ee_init_kwargs=ee_init_kwargs,
         )
-        logger.info("Got hourly data with %d timestamps", len(df_hourly))
+        logger.info(
+            "Got daily data with %d timestamps", ds_daily.sizes.get("time", 0)
+        )
         logger.info("Fetching site DEM at lat=%.4f, lon=%.4f", lat, lon)
         dem_value = _xee_fetch_site_dem(
             dem_asset=dem_asset,
@@ -180,9 +226,9 @@ def get_meteo_data(
             ee_init_kwargs=ee_init_kwargs,
         )
         logger.info("Got DEM value %.2f m", dem_value)
-        return mspec.postprocess_site(df_hourly, dem_value, tz)
+        return mspec.postprocess_site(ds_daily, dem_value, tz)
 
-    # BBox path
+    # ------------------------- BBox path ---------------------------------
     min_lon, min_lat, max_lon, max_lat = parse_bbox(loc)
     w_km, h_km = bbox_size_km(min_lon, min_lat, max_lon, max_lat)
     if w_km > 200.0 or h_km > 200.0:
@@ -192,8 +238,45 @@ def get_meteo_data(
         )
         raise ValueError(msg)
 
-    ds_hourly = _xee_fetch_bbox_hourly(
-        collection_id=ERA5L_ID,
+    logger.info(
+        "Fetching bbox data [%f,%f,%f,%f] (freq=%s)",
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        frequency,
+    )
+
+    if frequency == "hourly":
+        ds_hourly = _xee_fetch_bbox_hourly(
+            collection_id=collection_id,
+            bands=bands,
+            min_lon=min_lon,
+            min_lat=min_lat,
+            max_lon=max_lon,
+            max_lat=max_lat,
+            start=start,
+            end=end,
+            ee_init_kwargs=ee_init_kwargs,
+        )
+        logger.info(
+            "Got hourly bbox data with %d timestamps, "
+            "%d lat, %d lon",
+            ds_hourly.sizes.get("time", 0),
+            ds_hourly.sizes.get("lat", 0),
+            ds_hourly.sizes.get("lon", 0),
+        )
+        dem_grid = _xee_fetch_bbox_dem_on_grid(
+            dem_asset=dem_asset,
+            lats=ds_hourly["lat"].values,
+            lons=ds_hourly["lon"].values,
+            ee_init_kwargs=ee_init_kwargs,
+        )
+        return mspec.postprocess_area(ds_hourly, dem_grid, tz)
+
+    # Daily collections (e.g. FireDanger)
+    ds_daily = _xee_fetch_bbox_daily(
+        collection_id=collection_id,
         bands=bands,
         min_lon=min_lon,
         min_lat=min_lat,
@@ -203,21 +286,20 @@ def get_meteo_data(
         end=end,
         ee_init_kwargs=ee_init_kwargs,
     )
+    logger.info(
+        "Got daily bbox data with %d timestamps, "
+        "%d lat, %d lon",
+        ds_daily.sizes.get("time", 0),
+        ds_daily.sizes.get("lat", 0),
+        ds_daily.sizes.get("lon", 0),
+    )
     dem_grid = _xee_fetch_bbox_dem_on_grid(
         dem_asset=dem_asset,
-        lats=ds_hourly["lat"].values,
-        lons=ds_hourly["lon"].values,
+        lats=ds_daily["lat"].values,
+        lons=ds_daily["lon"].values,
         ee_init_kwargs=ee_init_kwargs,
     )
-    # dem_grid = _xee_fetch_bbox_dem(
-    #     dem_asset=dem_asset,
-    #     min_lon=min_lon,
-    #     min_lat=min_lat,
-    #     max_lon=max_lon,
-    #     max_lat=max_lat,
-    #     ee_init_kwargs=ee_init_kwargs,
-    # )
-    return mspec.postprocess_area(ds_hourly, dem_grid, tz)
+    return mspec.postprocess_area(ds_daily, dem_grid, tz)
 
 
 # ------------------------- xee adapters -----------------------
@@ -481,3 +563,105 @@ def _xee_fetch_bbox_dem_on_grid(
     )
     da.attrs["units"] = "m"
     return da
+
+def _xee_fetch_site_daily(
+    *,
+    collection_id: str,
+    bands: tuple[str, ...],
+    lat: float,
+    lon: float,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    ee_init_kwargs: dict | None = None,
+) -> xr.Dataset:
+    """Nearest-neighbour daily site series → xarray.Dataset.
+
+    Similar to _xee_fetch_site_hourly but for daily collections:
+    - no hourly reindex
+    - just tidy the time coord.
+    """
+    import ee  # type: ignore
+
+    try:
+        ee.Initialize(**(ee_init_kwargs or {}))
+    except Exception:
+        raise RuntimeError("Please initialise Earth Engine API before use.")
+
+    ic = (
+        ee.ImageCollection(collection_id)
+        .filterDate(start.isoformat(), end.isoformat())
+        .select(list(bands))
+    )
+    proj = ic.first().select(0).projection()
+    geom = ee.Geometry.Point(float(lon), float(lat))
+
+    ds = _ee_open_dataset(
+        src=ic,
+        geometry=geom,
+        bands=bands,
+        scale=0.25,  # FireDanger native ~0.25 deg
+        projection=proj,
+        ee_init_kwargs=ee_init_kwargs,
+    )
+
+    for d in ("lat", "lon"):
+        if d in ds.dims and ds.sizes.get(d, 1) == 1:
+            ds = ds.squeeze(d, drop=True)
+
+    # Tidy time coord
+    t = pd.to_datetime(ds.indexes["time"])
+    if t.tz is not None:
+        t = t.tz_convert("UTC").tz_localize(None)
+    ds = ds.assign_coords(time=t)
+    return ds
+
+
+def _xee_fetch_bbox_daily(
+    *,
+    collection_id: str,
+    bands: tuple[str, ...],
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    ee_init_kwargs: dict | None = None,
+) -> xr.Dataset:
+    """Daily bbox cube → xarray.Dataset for daily collections."""
+    import ee  # type: ignore
+
+    try:
+        ee.Initialize(**(ee_init_kwargs or {}))
+    except Exception:
+        raise RuntimeError("Please initialise Earth Engine API before use.")
+
+    ic = (
+        ee.ImageCollection(collection_id)
+        .filterDate(start.isoformat(), end.isoformat())
+        .select(list(bands))
+    )
+    proj = ic.first().select(0).projection()
+    geom = ee.Geometry.Rectangle(
+        float(min_lon), float(min_lat), float(max_lon), float(max_lat)
+    )
+
+    ds = _ee_open_dataset(
+        src=ic,
+        geometry=geom,
+        bands=bands,
+        scale=0.25,  # native resolution
+        projection=proj,
+        ee_init_kwargs=ee_init_kwargs,
+    )
+
+    if "lat" in ds.coords:
+        ds = ds.sortby("lat")
+    if "lon" in ds.coords:
+        ds = ds.sortby("lon")
+
+    t = pd.to_datetime(ds.indexes["time"])
+    if t.tz is not None:
+        t = t.tz_convert("UTC").tz_localize(None)
+    ds = ds.assign_coords(time=t)
+    return ds
