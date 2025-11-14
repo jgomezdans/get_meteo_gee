@@ -32,7 +32,8 @@ class FireDangerSpec:
         ----------
         ds_daily : xarray.Dataset
             Daily dataset from FireDanger collection for a single site.
-            Expected dims: ("time", "lat", "lon") with lat=lon=1.
+            For point sampling via xee, this is typically 1D on 'time'
+            only (no 'lat'/'lon' dims).
         dem_value : float
             DEM height (m) at site.
         tz : str
@@ -43,9 +44,9 @@ class FireDangerSpec:
         -------
         pandas.DataFrame
             Daily FireDanger indices with a 'DEM_m' column. Index is
-            tz-naive daily datetime.
+            tz-naive daily datetime (labelled 'DAY').
         """
-        ds = ds_daily.squeeze(("lat", "lon"), drop=True)
+        ds = ds_daily.copy()
 
         # Ensure a clean daily DatetimeIndex (tz-naive)
         idx = pd.to_datetime(ds.indexes["time"])
@@ -53,10 +54,17 @@ class FireDangerSpec:
             idx = idx.tz_convert("UTC").tz_localize(None)
         ds = ds.assign_coords(time=idx)
 
+        # Convert to DataFrame, index by time
         df = ds.to_dataframe().reset_index().set_index("time").sort_index()
+
+        # Make index a pure date (daily) and name it 'DAY'
+        df.index = df.index.normalize()
         df.index.name = "DAY"
+
+        # Append DEM
         df["DEM_m"] = float(dem_value)
         return df
+
 
     # ------------------------------------------------------------------
     # bbox: Dataset (time, lat, lon) -> Dataset + DEM grid
