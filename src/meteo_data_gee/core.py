@@ -17,6 +17,7 @@ import pandas as pd
 import xarray as xr
 
 from .sources import ERA5L_ID, DEM_DEFAULT
+from .sources import FIREDANGER_ID, FIREDANGER_BAD_INDEXES
 from .models import MODELS
 from .utils import (
     is_site,
@@ -831,6 +832,11 @@ def _xee_fetch_site_daily(
         .filterDate(start.isoformat(), end.isoformat())
         .select(list(bands))
     )
+        # FireDanger has at least one broken day; drop those indexes.
+    if collection_id == FIREDANGER_ID:
+        for bad in FIREDANGER_BAD_INDEXES:
+            ic = ic.filter(ee.Filter.neq("system:index", bad))
+    
     proj = ic.first().select(0).projection()
     geom = ee.Geometry.Point(float(lon), float(lat))
 
@@ -880,6 +886,10 @@ def _xee_fetch_bbox_daily(
         .filterDate(start.isoformat(), end.isoformat())
         .select(list(bands))
     )
+    if collection_id == FIREDANGER_ID:
+        for bad in FIREDANGER_BAD_INDEXES:
+            ic = ic.filter(ee.Filter.neq("system:index", bad))
+
     proj = ic.first().select(0).projection()
     geom = ee.Geometry.Rectangle(
         float(min_lon), float(min_lat), float(max_lon), float(max_lat)

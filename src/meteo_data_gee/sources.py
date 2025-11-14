@@ -73,4 +73,6 @@ FIREDANGER_BANDS = (
     "keetch_byram_drought_index",
     "spread_component",
 )
+# FireDanger known bad indexes (dates with missing/invalid data)
+FIREDANGER_BAD_INDEXES = ("20231205",)
 # Required bands for FireDanger model
